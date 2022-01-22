@@ -1,5 +1,5 @@
 /*   Naughts and Crosses (TIC TAC TOE) - MIDI Note Generator.
-     by John Melki-Wegner (AKA "Expensive Notes" on YouTube)
+     by John Wegner (AKA "Expensive Notes" on YouTube)
 
     Using a Teensy 4.1 with USB Host to send and recieve messages with a Launchpad Mini Mk3
 
