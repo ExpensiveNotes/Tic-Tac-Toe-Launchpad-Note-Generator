@@ -1,0 +1,458 @@
+/*   Naughts and Crosses (TIC TAC TOE) - MIDI Note Generator.
+     by John Melki-Wegner (AKA "Expensive Notes" on YouTube)
+
+    Using a Teensy 4.1 with USB Host to send and recieve messages with a Launchpad Mini Mk3
+
+    Make sure the Launchpad in Programmer mode after each reboot by:
+    Long Press the Session pad and then press StopMuteSolo then Session and then User. (Press pads consecutively)
+
+    Notes: Programmer Mode assumes a 10x10 grid except that row 10 and column 10 are off the screen
+            MIDI notes are received from the 8x8 grid
+            Bottom left corner is "origin" (1,1)
+            The Black pads send MIDI CC and send the message on press and release of the pad! I use code to ignore the release message
+
+    Launchkey Orientation: Arrow keys at the bottom (right)
+
+*/
+
+#include "USBHost_t36.h"
+//Define some colours based on the Launchpad programmers guide
+#define GREEN 87
+#define RED 5
+#define lineCol 34
+#define backgroundColour 51
+#define PINK 57
+#define DARKGREEN 64
+#define DARKRED 6
+
+//=== Launchpad Data =============================================================================
+
+//The Launchpad sends/receives information to the 8x8 grid via a single index whereas I want to use an xy grid
+//index that points to a pad on the Launchpad that it uses
+int noteIndex = 0;
+//xPos and yPos are the xy positions on the Launchpad that I use.
+//I translate between these xPos yPos and noteIndex in code for games.
+int xPos = 1;
+int yPos = 1;
+bool xTurn = true;  //Take turns playing
+int noteDIN1 = 0;   //The note to send to the first MIDI DIN socket
+int noteDIN2 = 0;   //The note to send to the second MIDI DIN socket
+int toggleSwitch1, toggleSwitch2, toggleSwitch3, toggleSwitch4, toggleSwitch5; //Hardware switches. I only use toggleSwitch1 for this game.
+
+//The following xy grid is bigger than the actual display to allow wrapping and easy calculations
+//store actual MIDI notes to send to the screen for display
+int gridDisplay [10][10] = {};
+
+//Naughts and Crosses Grid - 0 means empty - 1 means cross - 10 means naught
+int OXGrid [3][3];
+
+// used to eliminate double triggering of due to pressing black pad.
+// Note: launchPad sends CC values on press and release of black pads!!!
+int ignoreDoubleMessageLeftArrow = true;
+int ignoreDoubleMessageRightArrow = true;
+
+// === Music =====================================================================================
+//The music is based on MIDI notes. I use Root Notes of 48 and 36 later on which are C
+//Minor scale. These values are added to the rootnote to produce a note from the scale. Two octaves...
+int minorScale [15] = {0, 2, 3, 5, 7, 9, 10, 12, 14, 15, 17, 19, 21, 22, 24};
+
+//The sequence of notes to play - Feel free to change these for your own version if you want to.
+//These "notes" are offsets which index the minor scale above. I do it this way so you can change scales easily - although I haven't
+//incorporated this into this program
+int sequenceNotes[32] = {0, 2, 0, 4, 0, 2, 0, 4, 0, 2, 0, 4, 2, 4, 0, 4, 0, 2, 0, 4, 0, 4, 0, 2, 0, 2, 0, 4, 0, 4, 0, 2};
+int sequenceIndex = 0;  //Which note is playing
+//Offset amounts to alter the main sequence for interest. These values are changed when a Naught or Cross is pressed.
+int sequenceNotesOffset[32] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,};
+
+//MIDI
+int noteON1 = 144; // note on command Channel 1. I just use channel one for each MIDI output.
+byte midi_clock = 0xf8; //To send clock information to keep external synths in sync
+
+//delay time - Effectively determines the BPM (Beats per Minute) of the track. Smaller is faster
+int delayTime = 250;
+
+//=== Set up USB Host on Teensy ===============================================================
+USBHost myusb;
+MIDIDevice midi1(myusb);
+
+//=== Code ===================================================================================
+
+void setup()
+{
+  //USB Serial to computer for monitoring while testing
+  Serial.begin(9600);
+  Serial.println("USB Host Testing");
+
+  //Host USB
+  myusb.begin();
+  //MIDI functions defined for Launchpad interaction
+  midi1.setHandleNoteOn(OnNoteOn);
+  midi1.setHandleControlChange(OnControlChange);
+  //Set up each output to the correct MIDI rate for the DIN sockets to send to the synths
+  Serial1.begin(31250); //MIDI baud rate
+  Serial2.begin(31250); //MIDI baud rate
+  //Set up Toggle Switches for input
+  for (int i = 33; i < 38; i++) pinMode(i, INPUT_PULLUP);
+  //Initialize the grid
+  clearOXGrid();
+}
+
+void loop()
+{
+  midi1.read();                       //read in MIDI messages
+  checkSwitches();
+  if (toggleSwitch1 == HIGH) {        //Only play sounds if the switch toggleSwitch1 is "on"
+    displayOXGrid();                  // Update the display and grid
+    playSequenceNote();               // Notes on
+    sendMidiClockDelay(delayTime);    // waits while notes play and sends MIDI clock
+    notesOff();                       // Notes off
+  }
+}
+
+//=== Hardare ==========================================================
+
+void checkSwitches() {
+  //I used pins 33 to 37 on the Teensy Board for the switches as these are not needed by the default audioboard.
+  toggleSwitch1 = digitalRead(33);      //Turn music on or off
+  //  toggleSwitch2 = digitalRead(34);  <-- Not needed for this game
+  //  toggleSwitch3 = digitalRead(35);
+  //  toggleSwitch4 = digitalRead(36);
+  //  toggleSwitch5 = digitalRead(37);
+}
+
+// ===== Naughts and Crosses Stuff ===================================
+
+//for a new game clear the Naughts and Crosses Grid
+void clearOXGrid() {
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++) {
+      OXGrid[i][j] = 0;
+    }
+  }
+}
+
+//Clear Launchpad to background colours
+void clearGrid() {
+  //Purple middle section
+  for (int x = 2 ; x < 9; x++) {
+    for (int y = 2; y < 9; y++) {
+      //               translate to MIDI note     Colour            Channel 1
+      midi1.sendNoteOn(gridToMIDINote(x, y)     , backgroundColour, 1, 1);
+    }
+  }
+  //edges black
+  for (int i = 1; i < 10; i++) {
+    midi1.sendNoteOn(gridToMIDINote(1, i) , 0, 1, 1);
+    midi1.sendNoteOn(gridToMIDINote(9, i) , 0, 1, 1);
+    midi1.sendNoteOn(gridToMIDINote(i, 1) , 0, 1, 1);
+    midi1.sendNoteOn(gridToMIDINote(i, 9) , 0, 1, 1);
+  }
+}
+
+//These Line functions draw lines on the Launchpad by sending MIDI notes
+void verticalLine(int x, int col) {
+  for (int i = 3; i < 8; i++) {
+    midi1.sendNoteOn(gridToMIDINote(x, i) , col, 1, 1);
+  }
+}
+
+void horizontalLine(int y, int col) {
+  for (int i = 3; i < 8; i++) {
+    midi1.sendNoteOn(gridToMIDINote(i, y) , col, 1, 1);
+  }
+}
+
+void backSlashLine(int col) {
+  for (int i = 3; i < 8; i++) {
+    midi1.sendNoteOn(gridToMIDINote(10 - i, i) , col, 1, 1);
+  }
+}
+
+void forwardSlashLine(int col) {
+  for (int i = 3; i < 8; i++) {
+    midi1.sendNoteOn(gridToMIDINote(i, i) , col, 1, 1);
+  }
+}
+
+//=== Display ================================================================
+
+//Draw everything on Launchpad
+void displayOXGrid() {
+  clearGrid();
+
+  //Draw OX Grid lines
+  verticalLine(4, lineCol);
+  verticalLine(6, lineCol);
+  horizontalLine(4, lineCol);
+  horizontalLine(6, lineCol);
+
+  showNaughtsAndCrosses();
+  checkForAndShowWinner();
+  showOffsetNotes();
+  showSequencePosition();
+}
+
+void showNaughtsAndCrosses() {
+  //Show Naughts and Crosses using sendNoteOn.
+  for (int x = 0 ; x < 3; x++) {
+    for (int y = 0; y < 3; y++) {
+      switch (OXGrid[x][y]) {
+        case 0:
+          //                Position                             col               Mode
+          //                Note                                 Vel               Channel
+          midi1.sendNoteOn(gridToMIDINote(x * 2 + 3, y * 2 + 3) , backgroundColour, 1,        1);
+          break;
+        case 1:
+          // Cross
+          midi1.sendNoteOn(gridToMIDINote(x * 2 + 3, y * 2 + 3) , GREEN, 1, 1);
+          break;
+        case 10:
+          // Naught
+          midi1.sendNoteOn(gridToMIDINote(x * 2 + 3, y * 2 + 3) , RED, 1, 1);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+}
+
+void checkForAndShowWinner() {
+  //Check for winner and display it by drawing lines.
+  //A total of 3 means Crosses has won. 30 means Naughts has won
+  //Vertical x (green)
+  if (OXGrid[0][0] + OXGrid[0][1] + OXGrid[0][2] == 3) verticalLine(3, GREEN);
+  if (OXGrid[1][0] + OXGrid[1][1] + OXGrid[1][2] == 3) verticalLine(5, GREEN);
+  if (OXGrid[2][0] + OXGrid[2][1] + OXGrid[2][2] == 3) verticalLine(7, GREEN);
+
+  //Vertical Naughts 0 (red)
+  if (OXGrid[0][0] + OXGrid[0][1] + OXGrid[0][2] == 30) verticalLine(3, RED);
+  if (OXGrid[1][0] + OXGrid[1][1] + OXGrid[1][2] == 30) verticalLine(5, RED);
+  if (OXGrid[2][0] + OXGrid[2][1] + OXGrid[2][2] == 30) verticalLine(7, RED);
+
+  //Horizontal x  (green)
+  if (OXGrid[0][0] + OXGrid[1][0] + OXGrid[2][0] == 3) horizontalLine(3, GREEN);
+  if (OXGrid[0][1] + OXGrid[1][1] + OXGrid[2][1] == 3) horizontalLine(5, GREEN);
+  if (OXGrid[0][2] + OXGrid[1][2] + OXGrid[2][2] == 3) horizontalLine(7, GREEN);
+
+  //Horizontal 0 (red)
+  if (OXGrid[0][0] + OXGrid[1][0] + OXGrid[2][0] == 30) horizontalLine(3, RED);
+  if (OXGrid[0][1] + OXGrid[1][1] + OXGrid[2][1] == 30) horizontalLine(5, RED);
+  if (OXGrid[0][2] + OXGrid[1][2] + OXGrid[2][2] == 30) horizontalLine(7, RED);
+
+  //Backslash x (green)
+  if (OXGrid[2][0] + OXGrid[1][1] + OXGrid[0][2] == 3) backSlashLine( GREEN);
+  //Backslash 0 (red)
+  if (OXGrid[2][0] + OXGrid[1][1] + OXGrid[0][2] == 30) backSlashLine( RED);
+  //forwardSlash x (green)
+  if (OXGrid[0][0] + OXGrid[1][1] + OXGrid[2][2] == 3) forwardSlashLine( GREEN);
+  //forwardSlash 0 (red)
+  if (OXGrid[0][0] + OXGrid[1][1] + OXGrid[2][2] == 30) forwardSlashLine( RED);
+}
+
+//show offset notes on sequence display
+void showOffsetNotes() {
+  //I needed to translate a one dimensional sequence array into 4 different rows and columns to show the sequence around the outside of the game
+  for (int i = 0; i < 32; i++) {
+    if (sequenceNotesOffset[i] == 3) { //Crosses
+      if (i < 8) {
+        midi1.sendNoteOn(gridToMIDINote(i + 1, 1) , DARKGREEN, 1, 1);
+      } else if (i < 16) {
+        midi1.sendNoteOn(gridToMIDINote(9, i  - 7) , DARKGREEN, 1, 1);
+      } else if (i < 24) {
+        midi1.sendNoteOn(gridToMIDINote(25 - i, 9) , DARKGREEN, 1, 1);
+      } else  {
+        midi1.sendNoteOn(gridToMIDINote(1, 33 - i) , DARKGREEN, 1, 1);
+      }
+    }
+    if (sequenceNotesOffset[i] == 5) { //Naughts
+      if (i < 8) {
+        midi1.sendNoteOn(gridToMIDINote(i + 1, 1) , DARKRED, 1, 1);
+      } else if (i < 16) {
+        midi1.sendNoteOn(gridToMIDINote(9, i  - 7) , DARKRED, 1, 1);
+      } else if (i < 24) {
+        midi1.sendNoteOn(gridToMIDINote(25 - i, 9) , DARKRED, 1, 1);
+      } else  {
+        midi1.sendNoteOn(gridToMIDINote(1, 33 - i) , DARKRED, 1, 1);
+      }
+    }
+  }
+}
+
+//Show Sequence position along the border
+void showSequencePosition() {
+  if (sequenceIndex < 8) {
+    midi1.sendNoteOn(gridToMIDINote(sequenceIndex + 1, 1) , PINK, 1, 1);
+  } else if (sequenceIndex < 16) {
+    midi1.sendNoteOn(gridToMIDINote(9, sequenceIndex  - 7) , PINK, 1, 1);
+  } else if (sequenceIndex < 24) {
+    midi1.sendNoteOn(gridToMIDINote(25 - sequenceIndex, 9) , PINK, 1, 1);
+  } else  {
+    midi1.sendNoteOn(gridToMIDINote(1, 33 - sequenceIndex) , PINK, 1, 1);
+  }
+}
+
+// ======== Music Stuff ==================================================
+
+void playSequenceNote() {
+  //Turn a note on by sending MIDI to the external synths
+  //play sequence note on MIDI Output 1. 48 is a C note in MIDI
+  noteDIN1 = 48 + minorScale[sequenceNotes[sequenceIndex] + sequenceNotesOffset[sequenceIndex]];
+  playMIDInote1(noteON1, noteDIN1, 100);
+  //play only offset notes on MIDI output 2.
+  if (sequenceNotesOffset[sequenceIndex] != 0) {
+    //What note? 36 is also C but an octave lower
+    noteDIN2 = 36 + minorScale[sequenceNotes[sequenceIndex] +  sequenceNotesOffset[sequenceIndex]];
+    //Play new Note
+    playMIDInote2(noteON1, noteDIN2, 100);
+  }
+}
+
+//Wait enough time to keep the music on the beat
+void sendMidiClockDelay(int delayTime) {
+  //Used to determine when to send midi clock. It is sent more often than the beat.
+  int shortdelayTime = delayTime / 6;
+  for (int i = 0 ; i < 6; i++) {
+    //Send MIDI clock to each DIN socket
+    Serial1.write(midi_clock);
+    Serial2.write(midi_clock);
+    delay(shortdelayTime);
+  }
+}
+
+void notesOff() {
+  //Turn Notes off by sending MIDI to the external synths with velocity 0
+  playMIDInote1(noteON1, noteDIN1, 0);
+  playMIDInote2(noteON1, noteDIN2, 0);
+  sequenceIndex++;
+  if (sequenceIndex >= 32) sequenceIndex = 0;
+}
+
+
+//Serial out 1 - MIDI DIN 1
+void playMIDInote1(int command, int Note, int Velocity) {
+  //sending to the tx pin on Serial 1
+  Serial1.write(command);     //send note on or note off command
+  Serial1.write(Note);        //send pitch data
+  Serial1.write(Velocity);    //send velocity data
+}
+
+//Serial out 2 - MIDI DIN 2
+void playMIDInote2(int command, int Note, int Velocity) {
+  //sending to the tx pin on Serial 2
+  Serial2.write(command);     //send note on or note off command
+  Serial2.write(Note);        //send pitch data
+  Serial2.write(Velocity);    //send velocity data
+}
+
+// === Input Stuff =======================================
+
+int noteIndexToX(int noteIndex) {
+  //translate MIDI note from the Launchpad to an x position
+  return noteIndex % 10;
+}
+
+int noteIndexToY(int noteIndex) {
+  //translate MIDI note from the Launchpad to a y position
+  return int(noteIndex / 10);
+}
+
+int gridToMIDINote(int x, int y) {
+  //calculate the MIDI note to send from the x, y grid position
+  return (y * 10 + x);
+}
+
+//Find the x or y position on the Naughts and Crosses (TIC TAC TOE) grid when a pad is pressed
+int getxOXPos(int pos) {
+  // -1 means an incorrect pad has been pressed.
+  int x = -1;
+  switch (pos) {
+    case 3:
+      x = 0;
+      break;
+    case 5:
+      x = 1;
+      break;
+    case 7:
+      x = 2;
+      break;
+  }
+  return x;
+}
+
+// === Read pads ========================================
+
+// --- Main 8x8 grid -----------------------------------
+
+void OnNoteOn(byte channel, byte note, byte velocity)
+{
+  //which pad hit
+  noteIndex = note;
+  //translate to xy grid
+  xPos = noteIndexToX(noteIndex);
+  yPos = noteIndexToY(noteIndex);
+
+  //If a correct OXgrid position is chosen update OXGrid
+  int xOXPos = getxOXPos(xPos);
+  int yOXPos = getxOXPos(yPos);
+  //Only update correct pads
+  if (xOXPos != -1 && yOXPos != -1) {
+    //Whose turn?
+    if (xTurn) {
+      if (OXGrid[xOXPos][yOXPos] == 0) {
+        OXGrid[xOXPos][yOXPos] = 1;
+        sequenceNotesOffset[xOXPos * 3 + 9 * yOXPos] = 3;   //The offset for Crosses is 3
+        xTurn = false;
+      }
+    } else {
+      if (OXGrid[xOXPos][yOXPos] == 0) {
+        OXGrid[xOXPos][yOXPos] = 10;
+        sequenceNotesOffset[xOXPos * 3 + 9 * yOXPos] = 5;   //The offset for Naughts is 3
+        xTurn = true;
+      }
+    }
+  }
+}
+
+// --- Side (black) pads --------------------------------------
+
+void OnControlChange(byte channel, byte control, byte value) {
+  //I use the Launchpad upside down so the arrow keys are accessable
+
+  //The Arrows on the Launchpad send Control Change message (CC) for both the press and release of the pad!!!!
+  //Using ignoreDoubleMessageRightArrow and ignoreDoubleMessageLeftArrow to ignore the release of the pad message
+
+  //Left Arrow Pad on Launchpad - Slower music due to a longer delayTime
+  if (control == 93 ) {
+    if (ignoreDoubleMessageRightArrow) {
+      ignoreDoubleMessageRightArrow = false;
+    } else {
+      delayTime = delayTime + 100;
+      ignoreDoubleMessageRightArrow = true;
+    }
+  }
+
+  //Right Arrow Pad on Launchpad - Faster music due to a shorter delayTime
+  if (control == 94 ) {
+    if (ignoreDoubleMessageLeftArrow) {
+      ignoreDoubleMessageLeftArrow = false;
+    } else {
+      delayTime = delayTime - 100;
+      ignoreDoubleMessageLeftArrow = true;
+    }
+  }
+
+  //down Pad - don't care about double messages here...
+  //New game - clear the grid
+  if (control == 91) {
+    clearOXGrid();
+  }
+
+  //up Pad
+  if (control == 92) {
+    //Reset Offset Sequence to 0 offsets
+    for (int i = 0; i < 32; i++) {
+      sequenceNotesOffset[i] = 0;
+    }
+  }
+}
